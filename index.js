@@ -54,30 +54,35 @@ async function verifyToken(req, res, next) {
   }
 }
 
-// Check if user is admin
-async function isAdmin(email) {
-  return ADMIN_EMAILS.includes(email);
-}
-
-// Get user data from Firebase Auth UID
+// Get user data from Firestore
 async function getUserData(uid) {
   if (!db) return null;
-  const userDoc = await db.collection('users').doc(uid).get();
-  return userDoc.exists ? userDoc.data() : null;
+  try {
+    const userDoc = await db.collection('users').doc(uid).get();
+    return userDoc.exists ? userDoc.data() : null;
+  } catch (error) {
+    console.error('Error getting user data:', error);
+    return null;
+  }
 }
 
 // Update user balance
 async function updateUserBalance(uid, amount, operation = 'add') {
   if (!db) return null;
-  const userRef = db.collection('users').doc(uid);
-  const userDoc = await userRef.get();
-  const currentBalance = userDoc.data()?.balance || 0;
-  const newBalance = operation === 'add' ? currentBalance + amount : currentBalance - amount;
-  await userRef.update({ balance: newBalance });
-  return newBalance;
+  try {
+    const userRef = db.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+    const currentBalance = userDoc.data()?.balance || 0;
+    const newBalance = operation === 'add' ? currentBalance + amount : currentBalance - amount;
+    await userRef.update({ balance: newBalance });
+    return newBalance;
+  } catch (error) {
+    console.error('Error updating balance:', error);
+    return null;
+  }
 }
 
-// Root endpoint to check if API is running
+// Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
     message: 'FB ID Shop API is running',
@@ -95,7 +100,6 @@ app.post('/api/signup', async (req, res) => {
     
     const { username, email, whatsapp, password } = req.body;
 
-    // Validation
     if (!username || !username.match(/^[A-Za-z]+$/)) {
       return res.status(400).json({ error: 'Username must contain only alphabets' });
     }
@@ -106,20 +110,17 @@ app.post('/api/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    // Check if username exists
     const usernameCheck = await db.collection('users').where('username', '==', username).get();
     if (!usernameCheck.empty) {
       return res.status(400).json({ error: 'Username already taken' });
     }
 
-    // Create user in Firebase Auth
     const userRecord = await auth.createUser({
       email: email,
       password: password,
       displayName: username
     });
 
-    // Save user data in Firestore
     await db.collection('users').doc(userRecord.uid).set({
       uid: userRecord.uid,
       username: username,
@@ -140,7 +141,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN ENDPOINT - Email/Password Login
+// Login Endpoint
 app.post('/api/login', async (req, res) => {
   try {
     if (!auth || !db) throw new Error('Firebase not initialized');
@@ -151,7 +152,6 @@ app.post('/api/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
     
-    // Get user from Firebase Auth by email
     let userRecord;
     try {
       userRecord = await auth.getUserByEmail(email);
@@ -159,7 +159,6 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     
-    // Verify password using Firebase REST API
     const firebaseApiKey = process.env.FIREBASE_API_KEY;
     if (!firebaseApiKey) {
       return res.status(500).json({ error: 'Firebase API key not configured' });
@@ -177,14 +176,12 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     
-    // Get user data from Firestore
     const userData = await getUserData(userRecord.uid);
     
     if (userData?.isBlocked) {
       return res.status(403).json({ error: 'Your account has been blocked' });
     }
     
-    // Return token and user data
     res.json({
       message: 'Login successful',
       token: verifyData.idToken,
@@ -234,9 +231,9 @@ app.post('/api/verify-token', async (req, res) => {
   }
 });
 
-// ==================== BUY SECTION (PUBLIC) ====================
+// ==================== BUY SECTION ====================
 
-// Get available IDs with filters
+// Get available IDs
 app.get('/api/available-ids', async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -278,7 +275,7 @@ app.get('/api/available-ids', async (req, res) => {
   }
 });
 
-// Buy ID (Protected)
+// Buy ID
 app.post('/api/buy-id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -374,7 +371,7 @@ app.get('/api/user-balance', verifyToken, async (req, res) => {
   }
 });
 
-// Get My IDs (purchased)
+// Get My IDs
 app.get('/api/my-ids', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -619,7 +616,7 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
   }
 });
 
-// Get Withdrawal Status - FIXED: Handles missing createdAt field
+// Get Withdrawal Status - FIXED (handles missing createdAt)
 app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -655,7 +652,7 @@ app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
     res.json({ withdrawals });
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
 
@@ -878,7 +875,7 @@ app.get('/api/admin/user-stats/:userId', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Get Withdrawal Requests
+// Admin: Get Withdrawal Requests - FIXED (handles missing createdAt)
 app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -899,10 +896,22 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
     let withdrawals = [];
     
     snapshot.forEach(doc => {
-      withdrawals.push(doc.data());
+      const data = doc.data();
+      withdrawals.push({
+        id: data.id,
+        userId: data.userId,
+        username: data.username,
+        amount: data.amount,
+        method: data.method,
+        accountName: data.accountName,
+        accountNumber: data.accountNumber,
+        status: data.status,
+        reason: data.reason || '',
+        createdAt: data.createdAt || admin.firestore.FieldValue.serverTimestamp()
+      });
     });
     
-    // Sort manually
+    // Sort manually by createdAt (newest first)
     withdrawals.sort((a, b) => {
       const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(0);
       const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(0);
@@ -911,14 +920,15 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
     
     if (search) {
       withdrawals = withdrawals.filter(w => 
-        w.username?.includes(search) || w.accountNumber?.includes(search)
+        w.username?.toLowerCase().includes(search.toLowerCase()) || 
+        w.accountNumber?.includes(search)
       );
     }
     
     res.json({ withdrawals });
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error: ' + error.message });
   }
 });
 
@@ -942,7 +952,9 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     if (status === 'completed') {
       const withdrawal = await db.collection('withdrawals').doc(withdrawalId).get();
       const withdrawalData = withdrawal.data();
-      await updateUserBalance(withdrawalData.userId, withdrawalData.amount, 'subtract');
+      if (withdrawalData) {
+        await updateUserBalance(withdrawalData.userId, withdrawalData.amount, 'subtract');
+      }
     }
     
     res.json({ success: true, message: 'Withdrawal status updated' });
