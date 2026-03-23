@@ -566,7 +566,9 @@ app.delete('/api/delete-listing/:id', verifyToken, async (req, res) => {
   }
 });
 
-// Withdrawal Request
+// ==================== WITHDRAWAL (WITH BALANCE DEDUCT ON REQUEST) ====================
+
+// Withdrawal Request - DEDUCT BALANCE IMMEDIATELY
 app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -586,8 +588,18 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Minimum withdrawal amount is 100 PKR' });
     }
     
+    // Start a transaction to deduct balance and create withdrawal request
+    const batch = db.batch();
+    
+    // Deduct balance immediately
+    const userRef = db.collection('users').doc(req.user.uid);
+    batch.update(userRef, {
+      balance: admin.firestore.FieldValue.increment(-amount)
+    });
+    
+    // Create withdrawal request
     const withdrawalRef = db.collection('withdrawals').doc();
-    await withdrawalRef.set({
+    batch.set(withdrawalRef, {
       id: withdrawalRef.id,
       userId: req.user.uid,
       username: userData.username,
@@ -599,14 +611,16 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    res.json({ success: true, message: 'Withdrawal request submitted successfully' });
+    await batch.commit();
+    
+    res.json({ success: true, message: 'Withdrawal request submitted successfully. Amount deducted from balance.' });
   } catch (error) {
     console.error('Error creating withdrawal:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get Withdrawal Status - FIXED (no orderBy error)
+// Get Withdrawal Status
 app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -909,7 +923,7 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Update Withdrawal Status
+// Admin: Update Withdrawal Status (REJECT = REFUND, COMPLETE = NO REFUND)
 app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -921,18 +935,41 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     
     const { withdrawalId, status, reason } = req.body;
     
+    const withdrawalRef = db.collection('withdrawals').doc(withdrawalId);
+    const withdrawalDoc = await withdrawalRef.get();
+    
+    if (!withdrawalDoc.exists) {
+      return res.status(404).json({ error: 'Withdrawal request not found' });
+    }
+    
+    const withdrawalData = withdrawalDoc.data();
+    const currentStatus = withdrawalData.status;
+    
+    // If already processed, don't allow changes
+    if (currentStatus !== 'pending') {
+      return res.status(400).json({ error: 'Withdrawal already processed' });
+    }
+    
     const updates = { status };
     if (reason) updates.reason = reason;
     
-    await db.collection('withdrawals').doc(withdrawalId).update(updates);
-    
-    if (status === 'completed') {
-      const withdrawal = await db.collection('withdrawals').doc(withdrawalId).get();
-      const withdrawalData = withdrawal.data();
-      await updateUserBalance(withdrawalData.userId, withdrawalData.amount, 'subtract');
+    // If rejecting, refund the amount back to user balance
+    if (status === 'rejected') {
+      const userRef = db.collection('users').doc(withdrawalData.userId);
+      await userRef.update({
+        balance: admin.firestore.FieldValue.increment(withdrawalData.amount)
+      });
     }
     
-    res.json({ success: true, message: 'Withdrawal status updated' });
+    // If completing, no refund (amount already deducted when request was made)
+    // If pending, do nothing
+    
+    await withdrawalRef.update(updates);
+    
+    res.json({ 
+      success: true, 
+      message: status === 'rejected' ? 'Withdrawal rejected. Amount refunded to user balance.' : 'Withdrawal status updated' 
+    });
   } catch (error) {
     console.error('Error updating withdrawal:', error);
     res.status(500).json({ error: 'Internal server error' });
