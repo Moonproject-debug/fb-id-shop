@@ -1,23 +1,38 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // Initialize Firebase Admin SDK
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+let serviceAccount;
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} catch (error) {
+  console.error('Error parsing FIREBASE_SERVICE_ACCOUNT:', error.message);
+  serviceAccount = null;
+}
 
-const db = admin.firestore();
-const auth = admin.auth();
+if (serviceAccount) {
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount)
+    });
+    console.log('Firebase Admin initialized successfully');
+  } catch (error) {
+    console.error('Firebase initialization error:', error.message);
+  }
+} else {
+  console.error('FIREBASE_SERVICE_ACCOUNT environment variable is not set or invalid');
+}
+
+const db = admin.firestore ? admin.firestore() : null;
+const auth = admin.auth ? admin.auth() : null;
 
 // Constants
-const ADMIN_EMAILS = ['admin@fbidshop.com']; // Add admin emails here
+const ADMIN_EMAILS = ['admin@fbidshop.com'];
 const NON_VERIFIED_FEE = 5;
 const VERIFIED_FEE = 15;
 
@@ -30,6 +45,7 @@ async function verifyToken(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
+    if (!auth) throw new Error('Auth not initialized');
     const decodedToken = await auth.verifyIdToken(token);
     req.user = decodedToken;
     next();
@@ -45,12 +61,14 @@ async function isAdmin(email) {
 
 // Get user data from Firebase Auth UID
 async function getUserData(uid) {
+  if (!db) return null;
   const userDoc = await db.collection('users').doc(uid).get();
   return userDoc.exists ? userDoc.data() : null;
 }
 
 // Update user balance
 async function updateUserBalance(uid, amount, operation = 'add') {
+  if (!db) return null;
   const userRef = db.collection('users').doc(uid);
   const userDoc = await userRef.get();
   const currentBalance = userDoc.data()?.balance || 0;
@@ -59,19 +77,33 @@ async function updateUserBalance(uid, amount, operation = 'add') {
   return newBalance;
 }
 
+// Root endpoint to check if API is running
+app.get('/', (req, res) => {
+  res.json({ 
+    message: 'FB ID Shop API is running',
+    status: 'active',
+    firebase: serviceAccount ? 'initialized' : 'not initialized'
+  });
+});
+
 // ==================== AUTHENTICATION ====================
 
 // Sign Up
 app.post('/api/signup', async (req, res) => {
   try {
+    if (!auth || !db) throw new Error('Firebase not initialized');
+    
     const { username, email, whatsapp, password } = req.body;
 
     // Validation
-    if (!username.match(/^[A-Za-z]+$/)) {
+    if (!username || !username.match(/^[A-Za-z]+$/)) {
       return res.status(400).json({ error: 'Username must contain only alphabets' });
     }
-    if (!whatsapp.match(/^\d+$/)) {
+    if (!whatsapp || !whatsapp.match(/^\d+$/)) {
       return res.status(400).json({ error: 'WhatsApp number must contain only digits' });
+    }
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
     }
 
     // Check if username exists
@@ -111,6 +143,8 @@ app.post('/api/signup', async (req, res) => {
 // Login (Firebase handles on frontend, just verify token)
 app.post('/api/login', async (req, res) => {
   try {
+    if (!auth) throw new Error('Auth not initialized');
+    
     const { token } = req.body;
     const decodedToken = await auth.verifyIdToken(token);
     const userData = await getUserData(decodedToken.uid);
@@ -124,8 +158,8 @@ app.post('/api/login', async (req, res) => {
       user: { 
         uid: decodedToken.uid, 
         email: decodedToken.email,
-        username: userData.username,
-        isAdmin: userData.isAdmin || false
+        username: userData?.username,
+        isAdmin: userData?.isAdmin || false
       } 
     });
   } catch (error) {
@@ -138,6 +172,8 @@ app.post('/api/login', async (req, res) => {
 // Get available IDs with filters
 app.get('/api/available-ids', async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { type, minPrice, maxPrice, page = 1, limit = 20 } = req.query;
     
     let query = db.collection('ids').where('status', '==', 'available');
@@ -179,6 +215,8 @@ app.get('/api/available-ids', async (req, res) => {
 // Buy ID (Protected)
 app.post('/api/buy-id', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { idDocId } = req.body;
     const buyerId = req.user.uid;
     
@@ -269,6 +307,7 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
 // Get user balance
 app.get('/api/user-balance', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
     const userData = await getUserData(req.user.uid);
     res.json({ balance: userData?.balance || 0 });
   } catch (error) {
@@ -279,6 +318,8 @@ app.get('/api/user-balance', verifyToken, async (req, res) => {
 // Get My IDs (purchased)
 app.get('/api/my-ids', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const snapshot = await db.collection('ids')
       .where('buyerId', '==', req.user.uid)
       .where('status', '==', 'sold')
@@ -310,6 +351,8 @@ app.get('/api/my-ids', verifyToken, async (req, res) => {
 // Get My Listings
 app.get('/api/my-listings', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const snapshot = await db.collection('ids')
       .where('sellerId', '==', req.user.uid)
       .get();
@@ -340,6 +383,8 @@ app.get('/api/my-listings', verifyToken, async (req, res) => {
 // Add Single Listing
 app.post('/api/add-listing', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { uid, password, email2fa, twoFactor, price, type } = req.body;
     
     if (!uid || !password || !price || !type) {
@@ -376,7 +421,9 @@ app.post('/api/add-listing', verifyToken, async (req, res) => {
 // Bulk Upload
 app.post('/api/bulk-listing', verifyToken, async (req, res) => {
   try {
-    const { ids } = req.body; // Array of ID objects
+    if (!db) throw new Error('Database not initialized');
+    
+    const { ids } = req.body;
     
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'Invalid bulk data' });
@@ -418,9 +465,11 @@ app.post('/api/bulk-listing', verifyToken, async (req, res) => {
   }
 });
 
-// Edit Listing (only if available)
+// Edit Listing
 app.put('/api/edit-listing/:id', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { id } = req.params;
     const updates = req.body;
     
@@ -449,6 +498,8 @@ app.put('/api/edit-listing/:id', verifyToken, async (req, res) => {
 // Delete Listing
 app.delete('/api/delete-listing/:id', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { id } = req.params;
     
     const idDoc = await db.collection('ids').doc(id).get();
@@ -472,6 +523,8 @@ app.delete('/api/delete-listing/:id', verifyToken, async (req, res) => {
 // Withdrawal Request
 app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const { amount, method, accountName, accountNumber } = req.body;
     
     const userData = await getUserData(req.user.uid);
@@ -510,6 +563,8 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
 // Get Withdrawal Status
 app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const snapshot = await db.collection('withdrawals')
       .where('userId', '==', req.user.uid)
       .orderBy('createdAt', 'desc')
@@ -532,16 +587,16 @@ app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
 // Admin Dashboard Stats
 app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
-    // Get total users
     const usersSnapshot = await db.collection('users').get();
     const totalUsers = usersSnapshot.size;
     
-    // Get sold and available IDs
     const idsSnapshot = await db.collection('ids').get();
     let totalSold = 0;
     let totalAvailable = 0;
@@ -569,9 +624,11 @@ app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Get All IDs with pagination
+// Admin: Get All IDs
 app.get('/api/admin/all-ids', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -613,6 +670,8 @@ app.get('/api/admin/all-ids', verifyToken, async (req, res) => {
 // Admin: Get ID Details
 app.get('/api/admin/id-detail/:uid', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -643,9 +702,11 @@ app.get('/api/admin/id-detail/:uid', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Get All Users (paginated)
+// Admin: Get All Users
 app.get('/api/admin/all-users', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -653,13 +714,12 @@ app.get('/api/admin/all-users', verifyToken, async (req, res) => {
     
     const { page = 1, limit = 20, search = '' } = req.query;
     
-    let query = db.collection('users');
     let users = [];
     
     if (search) {
-      const emailQuery = await query.where('email', '==', search).get();
-      const usernameQuery = await query.where('username', '==', search).get();
-      const whatsappQuery = await query.where('whatsapp', '==', search).get();
+      const emailQuery = await db.collection('users').where('email', '==', search).get();
+      const usernameQuery = await db.collection('users').where('username', '==', search).get();
+      const whatsappQuery = await db.collection('users').where('whatsapp', '==', search).get();
       
       const combined = new Map();
       emailQuery.forEach(doc => combined.set(doc.id, doc.data()));
@@ -670,7 +730,7 @@ app.get('/api/admin/all-users', verifyToken, async (req, res) => {
         users.push({ id, ...data });
       });
     } else {
-      const snapshot = await query.get();
+      const snapshot = await db.collection('users').get();
       snapshot.forEach(doc => {
         users.push({ id: doc.id, ...doc.data() });
       });
@@ -686,9 +746,11 @@ app.get('/api/admin/all-users', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Update User (balance, block, delete)
+// Admin: Update User
 app.put('/api/admin/update-user', verifyToken, async (req, res) => {
   try {
+    if (!db || !auth) throw new Error('Firebase not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -717,6 +779,8 @@ app.put('/api/admin/update-user', verifyToken, async (req, res) => {
 // Admin: Get User Stats
 app.get('/api/admin/user-stats/:userId', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -740,6 +804,8 @@ app.get('/api/admin/user-stats/:userId', verifyToken, async (req, res) => {
 // Admin: Get Withdrawal Requests
 app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -775,6 +841,8 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
 // Admin: Update Withdrawal Status
 app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -787,7 +855,6 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     
     await db.collection('withdrawals').doc(withdrawalId).update(updates);
     
-    // If completed, deduct balance
     if (status === 'completed') {
       const withdrawal = await db.collection('withdrawals').doc(withdrawalId).get();
       const withdrawalData = withdrawal.data();
@@ -801,9 +868,11 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Add Balance Manually
+// Admin: Add Balance
 app.post('/api/admin/add-balance', verifyToken, async (req, res) => {
   try {
+    if (!db) throw new Error('Database not initialized');
+    
     const userData = await getUserData(req.user.uid);
     if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
       return res.status(403).json({ error: 'Admin access required' });
@@ -819,10 +888,5 @@ app.post('/api/admin/add-balance', verifyToken, async (req, res) => {
   }
 });
 
-// ==================== START SERVER ====================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
+// Export for Vercel
 module.exports = app;
