@@ -54,35 +54,30 @@ async function verifyToken(req, res, next) {
   }
 }
 
-// Get user data from Firestore
+// Check if user is admin
+async function isAdmin(email) {
+  return ADMIN_EMAILS.includes(email);
+}
+
+// Get user data from Firebase Auth UID
 async function getUserData(uid) {
   if (!db) return null;
-  try {
-    const userDoc = await db.collection('users').doc(uid).get();
-    return userDoc.exists ? userDoc.data() : null;
-  } catch (error) {
-    console.error('Error getting user data:', error);
-    return null;
-  }
+  const userDoc = await db.collection('users').doc(uid).get();
+  return userDoc.exists ? userDoc.data() : null;
 }
 
 // Update user balance
 async function updateUserBalance(uid, amount, operation = 'add') {
   if (!db) return null;
-  try {
-    const userRef = db.collection('users').doc(uid);
-    const userDoc = await userRef.get();
-    const currentBalance = userDoc.data()?.balance || 0;
-    const newBalance = operation === 'add' ? currentBalance + amount : currentBalance - amount;
-    await userRef.update({ balance: newBalance });
-    return newBalance;
-  } catch (error) {
-    console.error('Error updating balance:', error);
-    return null;
-  }
+  const userRef = db.collection('users').doc(uid);
+  const userDoc = await userRef.get();
+  const currentBalance = userDoc.data()?.balance || 0;
+  const newBalance = operation === 'add' ? currentBalance + amount : currentBalance - amount;
+  await userRef.update({ balance: newBalance });
+  return newBalance;
 }
 
-// Root endpoint
+// Root endpoint to check if API is running
 app.get('/', (req, res) => {
   res.json({ 
     message: 'FB ID Shop API is running',
@@ -100,6 +95,7 @@ app.post('/api/signup', async (req, res) => {
     
     const { username, email, whatsapp, password } = req.body;
 
+    // Validation
     if (!username || !username.match(/^[A-Za-z]+$/)) {
       return res.status(400).json({ error: 'Username must contain only alphabets' });
     }
@@ -110,17 +106,20 @@ app.post('/api/signup', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
+    // Check if username exists
     const usernameCheck = await db.collection('users').where('username', '==', username).get();
     if (!usernameCheck.empty) {
       return res.status(400).json({ error: 'Username already taken' });
     }
 
+    // Create user in Firebase Auth
     const userRecord = await auth.createUser({
       email: email,
       password: password,
       displayName: username
     });
 
+    // Save user data in Firestore
     await db.collection('users').doc(userRecord.uid).set({
       uid: userRecord.uid,
       username: username,
@@ -141,7 +140,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Login Endpoint
+// LOGIN ENDPOINT - Email/Password Login
 app.post('/api/login', async (req, res) => {
   try {
     if (!auth || !db) throw new Error('Firebase not initialized');
@@ -152,6 +151,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
     
+    // Get user from Firebase Auth by email
     let userRecord;
     try {
       userRecord = await auth.getUserByEmail(email);
@@ -159,6 +159,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     
+    // Verify password using Firebase REST API
     const firebaseApiKey = process.env.FIREBASE_API_KEY;
     if (!firebaseApiKey) {
       return res.status(500).json({ error: 'Firebase API key not configured' });
@@ -176,6 +177,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     
+    // Get user data from Firestore
     const userData = await getUserData(userRecord.uid);
     
     if (userData?.isBlocked) {
@@ -231,9 +233,9 @@ app.post('/api/verify-token', async (req, res) => {
   }
 });
 
-// ==================== BUY SECTION ====================
+// ==================== BUY SECTION (PUBLIC) ====================
 
-// Get available IDs
+// Get available IDs with filters
 app.get('/api/available-ids', async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -275,7 +277,7 @@ app.get('/api/available-ids', async (req, res) => {
   }
 });
 
-// Buy ID
+// Buy ID (Protected)
 app.post('/api/buy-id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -371,7 +373,7 @@ app.get('/api/user-balance', verifyToken, async (req, res) => {
   }
 });
 
-// Get My IDs
+// Get My IDs (purchased)
 app.get('/api/my-ids', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -616,7 +618,7 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
   }
 });
 
-// Get Withdrawal Status - FIXED (handles missing createdAt)
+// Get Withdrawal Status - FIXED (no orderBy issue)
 app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -652,7 +654,7 @@ app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
     res.json({ withdrawals });
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
-    res.status(500).json({ error: 'Internal server error: ' + error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -875,7 +877,7 @@ app.get('/api/admin/user-stats/:userId', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Get Withdrawal Requests - FIXED (handles missing createdAt)
+// Admin: Get Withdrawal Requests
 app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -896,22 +898,10 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
     let withdrawals = [];
     
     snapshot.forEach(doc => {
-      const data = doc.data();
-      withdrawals.push({
-        id: data.id,
-        userId: data.userId,
-        username: data.username,
-        amount: data.amount,
-        method: data.method,
-        accountName: data.accountName,
-        accountNumber: data.accountNumber,
-        status: data.status,
-        reason: data.reason || '',
-        createdAt: data.createdAt || admin.firestore.FieldValue.serverTimestamp()
-      });
+      withdrawals.push(doc.data());
     });
     
-    // Sort manually by createdAt (newest first)
+    // Sort manually by createdAt
     withdrawals.sort((a, b) => {
       const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(0);
       const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(0);
@@ -920,15 +910,14 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
     
     if (search) {
       withdrawals = withdrawals.filter(w => 
-        w.username?.toLowerCase().includes(search.toLowerCase()) || 
-        w.accountNumber?.includes(search)
+        w.username?.includes(search) || w.accountNumber?.includes(search)
       );
     }
     
     res.json({ withdrawals });
   } catch (error) {
     console.error('Error fetching withdrawals:', error);
-    res.status(500).json({ error: 'Internal server error: ' + error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -952,9 +941,7 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     if (status === 'completed') {
       const withdrawal = await db.collection('withdrawals').doc(withdrawalId).get();
       const withdrawalData = withdrawal.data();
-      if (withdrawalData) {
-        await updateUserBalance(withdrawalData.userId, withdrawalData.amount, 'subtract');
-      }
+      await updateUserBalance(withdrawalData.userId, withdrawalData.amount, 'subtract');
     }
     
     res.json({ success: true, message: 'Withdrawal status updated' });
