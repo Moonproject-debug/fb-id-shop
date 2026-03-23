@@ -140,7 +140,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// LOGIN ENDPOINT - Email/Password Login
+// LOGIN ENDPOINT - Email/Password Login (No Firebase Client SDK Required)
 app.post('/api/login', async (req, res) => {
   try {
     if (!auth || !db) throw new Error('Firebase not initialized');
@@ -159,12 +159,16 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
     
-    // Verify password using Firebase REST API
+    // IMPORTANT: Firebase Admin SDK cannot verify password directly
+    // For password verification, we need to use Firebase Auth REST API
+    // This is a workaround using Firebase REST API
+    
     const firebaseApiKey = process.env.FIREBASE_API_KEY;
     if (!firebaseApiKey) {
       return res.status(500).json({ error: 'Firebase API key not configured' });
     }
     
+    // Verify password using Firebase REST API
     const verifyResponse = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -184,6 +188,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(403).json({ error: 'Your account has been blocked' });
     }
     
+    // Return token and user data
     res.json({
       message: 'Login successful',
       token: verifyData.idToken,
@@ -201,7 +206,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Verify Token Endpoint
+// Verify Token Endpoint (for frontend to check if token is valid)
 app.post('/api/verify-token', async (req, res) => {
   try {
     if (!auth) throw new Error('Auth not initialized');
@@ -267,6 +272,7 @@ app.get('/api/available-ids', async (req, res) => {
       });
     });
     
+    // Pagination
     const start = (page - 1) * limit;
     const paginatedIds = ids.slice(start, start + limit);
     
@@ -300,27 +306,33 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'ID already sold' });
     }
     
+    // Check buyer balance
     if (buyerData.balance < idData.price) {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
     
+    // Calculate fee
     const fee = idData.type === 'Verified' ? VERIFIED_FEE : NON_VERIFIED_FEE;
     const sellerAmount = idData.price - fee;
     
+    // Start transaction
     const batch = db.batch();
     
+    // Deduct from buyer
     const buyerRef = db.collection('users').doc(buyerId);
     batch.update(buyerRef, {
       balance: admin.firestore.FieldValue.increment(-idData.price),
       totalBuy: admin.firestore.FieldValue.increment(1)
     });
     
+    // Add to seller
     const sellerRef = db.collection('users').doc(idData.sellerId);
     batch.update(sellerRef, {
       balance: admin.firestore.FieldValue.increment(sellerAmount),
       totalSell: admin.firestore.FieldValue.increment(1)
     });
     
+    // Update ID status
     const idRef = db.collection('ids').doc(idDocId);
     batch.update(idRef, {
       status: 'sold',
@@ -328,6 +340,7 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       soldAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
+    // Create transaction record
     const transactionRef = db.collection('transactions').doc();
     batch.set(transactionRef, {
       id: transactionRef.id,
@@ -618,37 +631,19 @@ app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
   }
 });
 
-// Get Withdrawal Status - FIXED (no orderBy issue)
+// Get Withdrawal Status
 app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
     
     const snapshot = await db.collection('withdrawals')
       .where('userId', '==', req.user.uid)
+      .orderBy('createdAt', 'desc')
       .get();
     
     const withdrawals = [];
     snapshot.forEach(doc => {
-      const data = doc.data();
-      withdrawals.push({
-        id: data.id,
-        userId: data.userId,
-        username: data.username,
-        amount: data.amount,
-        method: data.method,
-        accountName: data.accountName,
-        accountNumber: data.accountNumber,
-        status: data.status,
-        reason: data.reason || '',
-        createdAt: data.createdAt || admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-    
-    // Sort manually by createdAt (newest first)
-    withdrawals.sort((a, b) => {
-      const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(0);
-      const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(0);
-      return dateB - dateA;
+      withdrawals.push(doc.data());
     });
     
     res.json({ withdrawals });
@@ -894,23 +889,16 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
       query = query.where('status', '==', status);
     }
     
-    const snapshot = await query.get();
+    const snapshot = await query.orderBy('createdAt', 'desc').get();
     let withdrawals = [];
     
     snapshot.forEach(doc => {
       withdrawals.push(doc.data());
     });
     
-    // Sort manually by createdAt
-    withdrawals.sort((a, b) => {
-      const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(0);
-      const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(0);
-      return dateB - dateA;
-    });
-    
     if (search) {
       withdrawals = withdrawals.filter(w => 
-        w.username?.includes(search) || w.accountNumber?.includes(search)
+        w.username.includes(search) || w.accountNumber.includes(search)
       );
     }
     
