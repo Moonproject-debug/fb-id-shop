@@ -140,30 +140,101 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Login (Firebase handles on frontend, just verify token)
+// LOGIN ENDPOINT - Email/Password Login (No Firebase Client SDK Required)
 app.post('/api/login', async (req, res) => {
   try {
-    if (!auth) throw new Error('Auth not initialized');
+    if (!auth || !db) throw new Error('Firebase not initialized');
     
-    const { token } = req.body;
-    const decodedToken = await auth.verifyIdToken(token);
-    const userData = await getUserData(decodedToken.uid);
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+    
+    // Get user from Firebase Auth by email
+    let userRecord;
+    try {
+      userRecord = await auth.getUserByEmail(email);
+    } catch (error) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    // IMPORTANT: Firebase Admin SDK cannot verify password directly
+    // For password verification, we need to use Firebase Auth REST API
+    // This is a workaround using Firebase REST API
+    
+    const firebaseApiKey = process.env.FIREBASE_API_KEY;
+    if (!firebaseApiKey) {
+      return res.status(500).json({ error: 'Firebase API key not configured' });
+    }
+    
+    // Verify password using Firebase REST API
+    const verifyResponse = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${firebaseApiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: true })
+    });
+    
+    const verifyData = await verifyResponse.json();
+    
+    if (!verifyResponse.ok) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    // Get user data from Firestore
+    const userData = await getUserData(userRecord.uid);
     
     if (userData?.isBlocked) {
       return res.status(403).json({ error: 'Your account has been blocked' });
     }
+    
+    // Return token and user data
+    res.json({
+      message: 'Login successful',
+      token: verifyData.idToken,
+      user: {
+        uid: userRecord.uid,
+        email: userRecord.email,
+        username: userData?.username,
+        isAdmin: userData?.isAdmin || false
+      }
+    });
+    
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
-    res.json({ 
-      message: 'Login successful', 
-      user: { 
-        uid: decodedToken.uid, 
+// Verify Token Endpoint (for frontend to check if token is valid)
+app.post('/api/verify-token', async (req, res) => {
+  try {
+    if (!auth) throw new Error('Auth not initialized');
+    
+    const { token } = req.body;
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+    
+    const decodedToken = await auth.verifyIdToken(token);
+    const userData = await getUserData(decodedToken.uid);
+    
+    if (userData?.isBlocked) {
+      return res.status(403).json({ error: 'Account blocked' });
+    }
+    
+    res.json({
+      valid: true,
+      user: {
+        uid: decodedToken.uid,
         email: decodedToken.email,
         username: userData?.username,
         isAdmin: userData?.isAdmin || false
-      } 
+      }
     });
   } catch (error) {
-    res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ valid: false, error: 'Invalid token' });
   }
 });
 
@@ -888,5 +959,10 @@ app.post('/api/admin/add-balance', verifyToken, async (req, res) => {
   }
 });
 
-// Export for Vercel
+// ==================== START SERVER ====================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
 module.exports = app;
