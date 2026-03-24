@@ -31,10 +31,15 @@ if (serviceAccount) {
 const db = admin.firestore ? admin.firestore() : null;
 const auth = admin.auth ? admin.auth() : null;
 
-// Constants
+// Constants - New Fee Structure
+// Verified ID: Seller fee = 10 PKR, Buyer fee = 5 PKR, Total fee = 15 PKR
+// Non-Verified ID: Seller fee = 3 PKR, Buyer fee = 2 PKR, Total fee = 5 PKR
+const VERIFIED_SELLER_FEE = 10;
+const VERIFIED_BUYER_FEE = 5;
+const NON_VERIFIED_SELLER_FEE = 3;
+const NON_VERIFIED_BUYER_FEE = 2;
+
 const ADMIN_EMAILS = ['admin@fbidshop.com'];
-const NON_VERIFIED_FEE = 5;
-const VERIFIED_FEE = 15;
 
 // ==================== HELPER FUNCTIONS ====================
 
@@ -223,7 +228,7 @@ app.post('/api/verify-token', async (req, res) => {
 
 // ==================== BUY SECTION ====================
 
-// Get available IDs
+// Get available IDs - Returns buyer price (seller price + buyer fee)
 app.get('/api/available-ids', async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -241,15 +246,18 @@ app.get('/api/available-ids', async (req, res) => {
     
     snapshot.forEach(doc => {
       const data = doc.data();
-      let price = data.price;
+      // Calculate buyer price = seller price + buyer fee
+      const buyerFee = data.type === 'Verified' ? VERIFIED_BUYER_FEE : NON_VERIFIED_BUYER_FEE;
+      const buyerPrice = data.price + buyerFee;
       
-      if (minPrice && price < parseInt(minPrice)) return;
-      if (maxPrice && price > parseInt(maxPrice)) return;
+      if (minPrice && buyerPrice < parseInt(minPrice)) return;
+      if (maxPrice && buyerPrice > parseInt(maxPrice)) return;
       
       ids.push({
         id: doc.id,
         uid: data.uid,
-        price: data.price,
+        price: buyerPrice, // Show buyer price to customer
+        originalSellerPrice: data.price, // Keep original for reference
         type: data.type,
         sellerUsername: data.sellerUsername
       });
@@ -265,7 +273,7 @@ app.get('/api/available-ids', async (req, res) => {
   }
 });
 
-// Buy ID
+// Buy ID - New fee calculation
 app.post('/api/buy-id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -288,27 +296,42 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'ID already sold' });
     }
     
-    if (buyerData.balance < idData.price) {
-      return res.status(400).json({ error: 'Insufficient balance' });
+    // Calculate fees based on ID type
+    let sellerFee, buyerFee;
+    if (idData.type === 'Verified') {
+      sellerFee = VERIFIED_SELLER_FEE;
+      buyerFee = VERIFIED_BUYER_FEE;
+    } else {
+      sellerFee = NON_VERIFIED_SELLER_FEE;
+      buyerFee = NON_VERIFIED_BUYER_FEE;
     }
     
-    const fee = idData.type === 'Verified' ? VERIFIED_FEE : NON_VERIFIED_FEE;
-    const sellerAmount = idData.price - fee;
+    const sellerAmount = idData.price - sellerFee; // Seller gets original price minus seller fee
+    const buyerAmount = idData.price + buyerFee; // Buyer pays original price plus buyer fee
+    const totalFee = sellerFee + buyerFee; // Total platform earning
+    
+    // Check buyer balance
+    if (buyerData.balance < buyerAmount) {
+      return res.status(400).json({ error: `Insufficient balance. Required: ${buyerAmount} PKR` });
+    }
     
     const batch = db.batch();
     
+    // Deduct from buyer (full buyer amount)
     const buyerRef = db.collection('users').doc(buyerId);
     batch.update(buyerRef, {
-      balance: admin.firestore.FieldValue.increment(-idData.price),
+      balance: admin.firestore.FieldValue.increment(-buyerAmount),
       totalBuy: admin.firestore.FieldValue.increment(1)
     });
     
+    // Add to seller (original price minus seller fee)
     const sellerRef = db.collection('users').doc(idData.sellerId);
     batch.update(sellerRef, {
       balance: admin.firestore.FieldValue.increment(sellerAmount),
       totalSell: admin.firestore.FieldValue.increment(1)
     });
     
+    // Update ID status
     const idRef = db.collection('ids').doc(idDocId);
     batch.update(idRef, {
       status: 'sold',
@@ -316,6 +339,7 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       soldAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
+    // Create transaction record with detailed fee breakdown
     const transactionRef = db.collection('transactions').doc();
     batch.set(transactionRef, {
       id: transactionRef.id,
@@ -323,8 +347,11 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       idUid: idData.uid,
       buyerId: buyerId,
       sellerId: idData.sellerId,
-      amount: idData.price,
-      fee: fee,
+      sellerPrice: idData.price,
+      buyerPrice: buyerAmount,
+      sellerFee: sellerFee,
+      buyerFee: buyerFee,
+      totalFee: totalFee,
       sellerAmount: sellerAmount,
       type: idData.type,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -448,7 +475,7 @@ app.post('/api/add-listing', verifyToken, async (req, res) => {
       password: password,
       email2fa: email2fa || '',
       twoFactor: twoFactor || '',
-      price: parseInt(price),
+      price: parseInt(price), // This is seller's price (what seller gets before fees)
       type: type,
       sellerId: req.user.uid,
       sellerUsername: userData.username,
@@ -662,7 +689,7 @@ app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
 
 // ==================== ADMIN PANEL ====================
 
-// Admin Dashboard Stats
+// Admin Dashboard Stats - Total Earning from FEES only
 app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -678,13 +705,18 @@ app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
     const idsSnapshot = await db.collection('ids').get();
     let totalSold = 0;
     let totalAvailable = 0;
-    let totalEarning = 0;
+    let totalFeeEarning = 0;
     
     idsSnapshot.forEach(doc => {
       const data = doc.data();
       if (data.status === 'sold') {
         totalSold++;
-        totalEarning += data.price;
+        // Calculate fee earned from this sale
+        if (data.type === 'Verified') {
+          totalFeeEarning += (VERIFIED_SELLER_FEE + VERIFIED_BUYER_FEE);
+        } else {
+          totalFeeEarning += (NON_VERIFIED_SELLER_FEE + NON_VERIFIED_BUYER_FEE);
+        }
       } else if (data.status === 'available') {
         totalAvailable++;
       }
@@ -694,7 +726,7 @@ app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
       totalUsers,
       totalSold,
       totalAvailable,
-      totalEarning
+      totalEarning: totalFeeEarning
     });
   } catch (error) {
     console.error('Error fetching dashboard:', error);
