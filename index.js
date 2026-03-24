@@ -31,15 +31,16 @@ if (serviceAccount) {
 const db = admin.firestore ? admin.firestore() : null;
 const auth = admin.auth ? admin.auth() : null;
 
-// Constants - New Fee Structure
-// Verified ID: Seller fee = 10 PKR, Buyer fee = 5 PKR, Total fee = 15 PKR
-// Non-Verified ID: Seller fee = 3 PKR, Buyer fee = 2 PKR, Total fee = 5 PKR
+// Constants
+const ADMIN_EMAILS = ['admin@fbidshop.com'];
+
+// NEW FEE STRUCTURE
+// Verified ID: Seller fee = 10 PKR, Buyer fee = 5 PKR
+// Non-Verified ID: Seller fee = 3 PKR, Buyer fee = 2 PKR
 const VERIFIED_SELLER_FEE = 10;
 const VERIFIED_BUYER_FEE = 5;
 const NON_VERIFIED_SELLER_FEE = 3;
 const NON_VERIFIED_BUYER_FEE = 2;
-
-const ADMIN_EMAILS = ['admin@fbidshop.com'];
 
 // ==================== HELPER FUNCTIONS ====================
 
@@ -75,6 +76,29 @@ async function updateUserBalance(uid, amount, operation = 'add') {
   const newBalance = operation === 'add' ? currentBalance + amount : currentBalance - amount;
   await userRef.update({ balance: newBalance });
   return newBalance;
+}
+
+// Get fee structure for ID type
+function getFees(type) {
+  if (type === 'Verified') {
+    return {
+      sellerFee: VERIFIED_SELLER_FEE,
+      buyerFee: VERIFIED_BUYER_FEE,
+      platformFee: VERIFIED_SELLER_FEE + VERIFIED_BUYER_FEE
+    };
+  } else {
+    return {
+      sellerFee: NON_VERIFIED_SELLER_FEE,
+      buyerFee: NON_VERIFIED_BUYER_FEE,
+      platformFee: NON_VERIFIED_SELLER_FEE + NON_VERIFIED_BUYER_FEE
+    };
+  }
+}
+
+// Get final price for buyer (seller price + buyer fee)
+function getFinalPrice(sellerPrice, type) {
+  const fees = getFees(type);
+  return sellerPrice + fees.buyerFee;
 }
 
 // Root endpoint
@@ -228,7 +252,7 @@ app.post('/api/verify-token', async (req, res) => {
 
 // ==================== BUY SECTION ====================
 
-// Get available IDs - Returns buyer price (seller price + buyer fee)
+// Get available IDs (shows final price to buyer)
 app.get('/api/available-ids', async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -246,23 +270,24 @@ app.get('/api/available-ids', async (req, res) => {
     
     snapshot.forEach(doc => {
       const data = doc.data();
-      // Calculate buyer price = seller price + buyer fee
-      const buyerFee = data.type === 'Verified' ? VERIFIED_BUYER_FEE : NON_VERIFIED_BUYER_FEE;
-      const buyerPrice = data.price + buyerFee;
+      const sellerPrice = data.price;
+      // Calculate final price for buyer (seller price + buyer fee)
+      const finalPrice = getFinalPrice(sellerPrice, data.type);
       
-      if (minPrice && buyerPrice < parseInt(minPrice)) return;
-      if (maxPrice && buyerPrice > parseInt(maxPrice)) return;
+      if (minPrice && finalPrice < parseInt(minPrice)) return;
+      if (maxPrice && finalPrice > parseInt(maxPrice)) return;
       
       ids.push({
         id: doc.id,
         uid: data.uid,
-        price: buyerPrice, // Show buyer price to customer
-        originalSellerPrice: data.price, // Keep original for reference
+        price: finalPrice, // Buyer sees final price
+        originalPrice: sellerPrice, // Store original for internal use
         type: data.type,
         sellerUsername: data.sellerUsername
       });
     });
     
+    // Pagination
     const start = (page - 1) * limit;
     const paginatedIds = ids.slice(start, start + limit);
     
@@ -273,7 +298,7 @@ app.get('/api/available-ids', async (req, res) => {
   }
 });
 
-// Buy ID - New fee calculation
+// Buy ID - Updated with new fee structure
 app.post('/api/buy-id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -296,35 +321,29 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'ID already sold' });
     }
     
-    // Calculate fees based on ID type
-    let sellerFee, buyerFee;
-    if (idData.type === 'Verified') {
-      sellerFee = VERIFIED_SELLER_FEE;
-      buyerFee = VERIFIED_BUYER_FEE;
-    } else {
-      sellerFee = NON_VERIFIED_SELLER_FEE;
-      buyerFee = NON_VERIFIED_BUYER_FEE;
+    // Get fees based on ID type
+    const fees = getFees(idData.type);
+    const sellerPrice = idData.price;
+    const finalPrice = sellerPrice + fees.buyerFee; // Buyer pays seller price + buyer fee
+    const sellerAmount = sellerPrice - fees.sellerFee; // Seller receives seller price - seller fee
+    const platformEarning = fees.buyerFee + fees.sellerFee; // Platform earns both fees
+    
+    // Check buyer balance (using final price)
+    if (buyerData.balance < finalPrice) {
+      return res.status(400).json({ error: 'Insufficient balance' });
     }
     
-    const sellerAmount = idData.price - sellerFee; // Seller gets original price minus seller fee
-    const buyerAmount = idData.price + buyerFee; // Buyer pays original price plus buyer fee
-    const totalFee = sellerFee + buyerFee; // Total platform earning
-    
-    // Check buyer balance
-    if (buyerData.balance < buyerAmount) {
-      return res.status(400).json({ error: `Insufficient balance. Required: ${buyerAmount} PKR` });
-    }
-    
+    // Start transaction
     const batch = db.batch();
     
-    // Deduct from buyer (full buyer amount)
+    // Deduct final price from buyer
     const buyerRef = db.collection('users').doc(buyerId);
     batch.update(buyerRef, {
-      balance: admin.firestore.FieldValue.increment(-buyerAmount),
+      balance: admin.firestore.FieldValue.increment(-finalPrice),
       totalBuy: admin.firestore.FieldValue.increment(1)
     });
     
-    // Add to seller (original price minus seller fee)
+    // Add seller amount to seller
     const sellerRef = db.collection('users').doc(idData.sellerId);
     batch.update(sellerRef, {
       balance: admin.firestore.FieldValue.increment(sellerAmount),
@@ -339,7 +358,7 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       soldAt: admin.firestore.FieldValue.serverTimestamp()
     });
     
-    // Create transaction record with detailed fee breakdown
+    // Create transaction record with detailed fees
     const transactionRef = db.collection('transactions').doc();
     batch.set(transactionRef, {
       id: transactionRef.id,
@@ -347,11 +366,11 @@ app.post('/api/buy-id', verifyToken, async (req, res) => {
       idUid: idData.uid,
       buyerId: buyerId,
       sellerId: idData.sellerId,
-      sellerPrice: idData.price,
-      buyerPrice: buyerAmount,
-      sellerFee: sellerFee,
-      buyerFee: buyerFee,
-      totalFee: totalFee,
+      sellerPrice: sellerPrice,
+      finalPrice: finalPrice,
+      buyerFee: fees.buyerFee,
+      sellerFee: fees.sellerFee,
+      platformEarning: platformEarning,
       sellerAmount: sellerAmount,
       type: idData.type,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
@@ -388,7 +407,7 @@ app.get('/api/user-balance', verifyToken, async (req, res) => {
   }
 });
 
-// Get My IDs
+// Get My IDs (purchased)
 app.get('/api/my-ids', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -439,7 +458,7 @@ app.get('/api/my-listings', verifyToken, async (req, res) => {
         password: data.password,
         email2fa: data.email2fa || '',
         twoFactor: data.twoFactor || '',
-        price: data.price,
+        price: data.price, // Seller's listing price
         type: data.type,
         status: data.status,
         createdAt: data.addedAt
@@ -475,7 +494,7 @@ app.post('/api/add-listing', verifyToken, async (req, res) => {
       password: password,
       email2fa: email2fa || '',
       twoFactor: twoFactor || '',
-      price: parseInt(price), // This is seller's price (what seller gets before fees)
+      price: parseInt(price), // Seller's listing price
       type: type,
       sellerId: req.user.uid,
       sellerUsername: userData.username,
@@ -593,7 +612,7 @@ app.delete('/api/delete-listing/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ==================== WITHDRAWAL (WITH BALANCE DEDUCT ON REQUEST) ====================
+// ==================== WITHDRAWAL ====================
 
 // Withdrawal Request - DEDUCT BALANCE IMMEDIATELY
 app.post('/api/withdrawal-request', verifyToken, async (req, res) => {
@@ -689,7 +708,7 @@ app.get('/api/withdrawal-status', verifyToken, async (req, res) => {
 
 // ==================== ADMIN PANEL ====================
 
-// Admin Dashboard Stats - Total Earning from FEES only
+// Admin Dashboard Stats - Shows ONLY PLATFORM EARNING (total fees collected)
 app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -705,28 +724,30 @@ app.get('/api/admin/dashboard', verifyToken, async (req, res) => {
     const idsSnapshot = await db.collection('ids').get();
     let totalSold = 0;
     let totalAvailable = 0;
-    let totalFeeEarning = 0;
     
     idsSnapshot.forEach(doc => {
       const data = doc.data();
       if (data.status === 'sold') {
         totalSold++;
-        // Calculate fee earned from this sale
-        if (data.type === 'Verified') {
-          totalFeeEarning += (VERIFIED_SELLER_FEE + VERIFIED_BUYER_FEE);
-        } else {
-          totalFeeEarning += (NON_VERIFIED_SELLER_FEE + NON_VERIFIED_BUYER_FEE);
-        }
       } else if (data.status === 'available') {
         totalAvailable++;
       }
+    });
+    
+    // Calculate total platform earning from transactions
+    const transactionsSnapshot = await db.collection('transactions').get();
+    let totalPlatformEarning = 0;
+    
+    transactionsSnapshot.forEach(doc => {
+      const data = doc.data();
+      totalPlatformEarning += data.platformEarning || (data.buyerFee + data.sellerFee) || 0;
     });
     
     res.json({
       totalUsers,
       totalSold,
       totalAvailable,
-      totalEarning: totalFeeEarning
+      totalEarning: totalPlatformEarning // Platform earning from fees only
     });
   } catch (error) {
     console.error('Error fetching dashboard:', error);
@@ -955,7 +976,7 @@ app.get('/api/admin/withdrawal-requests', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Update Withdrawal Status (REJECT = REFUND, COMPLETE = NO REFUND)
+// Admin: Update Withdrawal Status
 app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -977,7 +998,6 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     const withdrawalData = withdrawalDoc.data();
     const currentStatus = withdrawalData.status;
     
-    // If already processed, don't allow changes
     if (currentStatus !== 'pending') {
       return res.status(400).json({ error: 'Withdrawal already processed' });
     }
@@ -985,16 +1005,12 @@ app.put('/api/admin/update-withdrawal', verifyToken, async (req, res) => {
     const updates = { status };
     if (reason) updates.reason = reason;
     
-    // If rejecting, refund the amount back to user balance
     if (status === 'rejected') {
       const userRef = db.collection('users').doc(withdrawalData.userId);
       await userRef.update({
         balance: admin.firestore.FieldValue.increment(withdrawalData.amount)
       });
     }
-    
-    // If completing, no refund (amount already deducted when request was made)
-    // If pending, do nothing
     
     await withdrawalRef.update(updates);
     
