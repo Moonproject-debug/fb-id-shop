@@ -587,7 +587,7 @@ app.put('/api/edit-listing/:id', verifyToken, async (req, res) => {
   }
 });
 
-// Delete Listing
+// Delete Listing (User)
 app.delete('/api/delete-listing/:id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -829,6 +829,40 @@ app.get('/api/admin/id-detail/:uid', verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching ID detail:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin: Delete ID Listing (Permanent Delete)
+app.delete('/api/admin/delete-id/:id', verifyToken, async (req, res) => {
+  try {
+    if (!db) throw new Error('Database not initialized');
+    
+    const userData = await getUserData(req.user.uid);
+    if (!userData?.isAdmin && !ADMIN_EMAILS.includes(req.user.email)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const { id } = req.params;
+    
+    const idDoc = await db.collection('ids').doc(id).get();
+    if (!idDoc.exists) {
+      return res.status(404).json({ error: 'ID listing not found' });
+    }
+    
+    const idData = idDoc.data();
+    
+    // Delete the ID document
+    await db.collection('ids').doc(id).delete();
+    
+    res.json({ 
+      success: true, 
+      message: `ID listing deleted successfully (UID: ${idData.uid})`,
+      deletedId: id,
+      deletedUid: idData.uid
+    });
+  } catch (error) {
+    console.error('Error deleting ID:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
