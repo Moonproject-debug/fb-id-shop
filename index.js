@@ -833,7 +833,7 @@ app.get('/api/admin/id-detail/:uid', verifyToken, async (req, res) => {
   }
 });
 
-// Admin: Delete ID Listing (Permanent Delete)
+// Admin: Delete ID Listing (Admin Only)
 app.delete('/api/admin/delete-id/:id', verifyToken, async (req, res) => {
   try {
     if (!db) throw new Error('Database not initialized');
@@ -852,14 +852,15 @@ app.delete('/api/admin/delete-id/:id', verifyToken, async (req, res) => {
     
     const idData = idDoc.data();
     
-    // Delete the ID document
+    // Delete the ID listing
     await db.collection('ids').doc(id).delete();
+    
+    // Log deletion (optional - can add to audit log collection)
+    console.log(`Admin ${req.user.email} deleted ID listing: ${idData.uid}`);
     
     res.json({ 
       success: true, 
-      message: `ID listing deleted successfully (UID: ${idData.uid})`,
-      deletedId: id,
-      deletedUid: idData.uid
+      message: `ID ${idData.uid} deleted successfully` 
     });
   } catch (error) {
     console.error('Error deleting ID:', error);
